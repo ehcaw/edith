@@ -1,77 +1,131 @@
 import Foundation
 import AVFoundation
 import Speech
+#if canImport(AIProxy)
+import AIProxy
+#endif
 
-// MARK: - Audio Capture & VAD
-class AudioCapture {
-    private let engine = AVAudioEngine()
-    private let inputNode: AVAudioInputNode
-    private let format: AVAudioFormat
+// MARK: - Simple Speech Recorder
+class SpeechRecorderAndTranscriber {
+    let recorder = AVAudioRecorder()
+    var currentAudioUrl = ""
 
-    init() {
-        self.inputNode = engine.inputNode
-        self.format = inputNode.outputFormat(forBus: 0)
-        setupAudioTap()
-    }
-
-    private func setupAudioTap() {
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            // TODO: integrate VAD and buffering
+    func startRecording() {
+        if(currentAudioUrl != "") {
+            currentAudioUrl = ""
         }
-    }
 
-    func start() throws {
-        try engine.start()
-        print("Audio engine started")
-    }
-}
-
-// MARK: - Speech-to-Text
-class SpeechTranscriber {
-    private let recognizer = SFSpeechRecognizer()
-    private let request = SFSpeechAudioBufferRecognitionRequest()
-
-    func transcribe(buffer: AVAudioPCMBuffer, completion: @escaping (String?) -> Void) {
-        request.append(buffer)
-        recognizer?.recognitionTask(with: request) { result, error in
-            guard let text = result?.bestTranscription.formattedString, error == nil else {
-                completion(nil)
-                return
+        do {
+            let success = try recorder.prepareToRecord()
+            if success {
+                recorder.record()
+            } else {
+                print("Failed to prepare to record")
             }
-            completion(text)
+        } catch {
+            print("Error preparing to record: \(error)")
+        }
+    }
+
+    func transcribe(completion: @escaping (Result<String, Error>) -> Void) {
+        guard !currentAudioUrl.isEmpty else {
+            completion(.failure(NSError(domain: "RecordingError", code: 1, userInfo: [NSLocalizedDescriptionKey: "No audio recording available"])))
+            return
+        }
+
+        guard let url = URL(string: currentAudioUrl) else {
+            completion(.failure(NSError(domain: "RecordingError", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid audio URL"])))
+            return
+        }
+
+        AIManager.shared.transcribeAudio(from: url, completion: completion)
+    }
+
+    func stopRecording () {
+        recorder.stop()
+        currentAudioUrl = recorder.url.absoluteString
+
+        transcribe { result in
+            switch result {
+            case .success(let transcript):
+                print("Transcription: \(transcript)")
+                // Process the transcript further if needed
+            case .failure(let error):
+                print("Transcription error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    public func getCurrentAudioUrl() -> String {
+        return currentAudioUrl
+    }
+
+    func transcribe() {
+
+    }
+}
+
+
+// MARK: - Recording Errors
+enum RecordingError: Error, LocalizedError {
+    case speechRecognizerNotAvailable
+    case unableToCreateRequest
+    case audioEngineError
+
+    var errorDescription: String? {
+        switch self {
+        case .speechRecognizerNotAvailable:
+            return "Speech recognizer is not available"
+        case .unableToCreateRequest:
+            return "Unable to create speech recognition request"
+        case .audioEngineError:
+            return "Audio engine error"
         }
     }
 }
-	
+
 // MARK: - AI Manager
-struct FunctionCall {
-    let name: String
-    let arguments: [String: Any]
-}
-
 class AIManager {
-    // TODO: configure OpenAI client
+    static let shared = AIManager()
 
-    func process(text: String, completion: @escaping (String) -> Void) {
-        // 1. Send `text` + function definitions to LLM
-        // 2. Handle function calls via ToolManager
-        // 3. Return final reply string
-        completion("[AI response for: \(text)]")
+    #if canImport(AIProxy)
+    private let groqService = AIProxy.groqDirectService(
+        unprotectedAPIKey: "KEY HERE"
+    )
+    #endif
+
+    private init() {}
+
+    func transcribeAudio(from url: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        #if canImport(AIProxy)
+        Task {
+            do {
+                let audioData = try Data(contentsOf: url)
+                let requestBody = GroqTranscriptionRequstBody(
+                    file: audioData,
+                    model: "whisper-large-v3-turbo",
+                    responseFormat: .json
+                )
+                let response = try await groqService.createTranscriptionRequest(body: requestBody)
+                let transcript = responseText.text ?? "None"
+                print("Groq transcribed: \(transcript)")
+                completion(.success(transcription))
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+        #else
+        completion(.failure(NSError(domain: "AIProxyError", code: 0, userInfo: [NSLocalizedDescriptionKey: "AIProxy not available"])))
+        #endif
     }
-}
 
-
-// MARK: - Tool Manager
-class ToolManager {
-    static let shared = ToolManager()
-
-    func handle(call: FunctionCall, aiCompletion: @escaping (String) -> Void) {
-        switch call.name {
-        case "play_music":
-            // TODO: implement AppleScript or Music API
-            aiCompletion("Playing music...")
-        default:
-            aiCompletion("Unknown function: \(call.name)")
+    func processTranscript(_ text: String, completion: @escaping (String) -> Void) {
+        // TODO: Send text to LLM and get response
+        // For now, return simple echo
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            completion("I heard you say: \(text)")
         }
     }
 }
@@ -82,29 +136,69 @@ class SpeechSynthesizer {
 
     func speak(_ text: String) {
         let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = 0.5
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
         synthesizer.speak(utterance)
+    }
+
+    func stopSpeaking() {
+        synthesizer.stopSpeaking(at: .immediate)
     }
 }
 
-// MARK: - Application
+// MARK: - Voice Assistant Main Class
 class VoiceAssistant {
-    let audioCapture = AudioCapture()
-    let transcriber = SpeechTranscriber()
+    let recorder = SpeechRecorder.shared
     let aiManager = AIManager()
     let synthesizer = SpeechSynthesizer()
 
-    func start() {
-        do {
-            try audioCapture.start()
-        } catch {
-            print("Failed to start audio: \(error)")
-            return
-        }
+    // Callbacks for UI updates
+    var onTranscriptionUpdate: ((String) -> Void)?
+    var onResponseReceived: ((String) -> Void)?
 
-        // Placeholder: simulate an utterance
-        let sampleText = "YOOHOO"
-        aiManager.process(text: sampleText) { [weak self] reply in
-            self?.synthesizer.speak(reply)
+    init() {
+        setupRecorderCallbacks()
+    }
+
+    private func setupRecorderCallbacks() {
+        recorder.onTranscription = { [weak self] transcript, isFinal in
+            DispatchQueue.main.async {
+                self?.onTranscriptionUpdate?(transcript)
+
+                // When transcription is final, process with AI
+                if isFinal && !transcript.isEmpty {
+                    self?.processWithAI(transcript)
+                }
+            }
         }
+    }
+
+    func startRecording() throws {
+        try recorder.startRecording()
+    }
+
+    func stopRecording() {
+        recorder.stopRecording()
+    }
+
+    func isRecording() -> Bool {
+        return recorder.isCurrentlyRecording
+    }
+
+    private func processWithAI(_ transcript: String) {
+        aiManager.processTranscript(transcript) { [weak self] response in
+            DispatchQueue.main.async {
+                self?.onResponseReceived?(response)
+                self?.synthesizer.speak(response)
+            }
+        }
+    }
+
+    func speak(_ text: String) {
+        synthesizer.speak(text)
+    }
+
+    func stopSpeaking() {
+        synthesizer.stopSpeaking()
     }
 }
